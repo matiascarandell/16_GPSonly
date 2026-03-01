@@ -2,7 +2,7 @@
   GPS-only (ESP32)
   - Activa relé GPS_KIM
   - Timeout GPS: 3 minuts
-  - Deep sleep: 30 segons - ja no és un test ewff rek cmamnk
+  - Deep sleep: 30 segons 
 */
 
 #include <Arduino.h>
