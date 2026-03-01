@@ -1,8 +1,8 @@
 /*
   GPS-only (ESP32)
-  - Activa relé GPS_KIM
-  - Timeout GPS: 3 minuts
-  - Deep sleep: 30 segons 
+  - Powers the GPS module through GPS_KIM
+  - GPS timeout: 3 minutes
+  - Deep sleep: 30 seconds
 */
 
 #include <Arduino.h>
@@ -11,29 +11,38 @@
 #include <RTClib.h>
 #include "esp_sleep.h"
 
-//------ GPS
-#define RXPin_GPS 4
-#define TXPin_GPS 2
-#define GPSBaud   9600
+namespace {
+constexpr uint8_t RXPinGPS = 4;
+constexpr uint8_t TXPinGPS = 2;
+constexpr uint32_t kGpsBaud = 9600;
 
-#define GPS_KIM 13
-#define PB_1 25
+constexpr uint8_t GPSPowerPin = 13;
+constexpr uint8_t ButtonPin = 25;
+
+constexpr uint32_t kGpsTimeoutMs = 180000;
+constexpr uint64_t kDeepSleepDurationUs = 30ULL * 1000000ULL;
+}  // namespace
 
 TinyGPSPlus gps;
-SoftwareSerial gpsSerial(RXPin_GPS, TXPin_GPS);
+SoftwareSerial gpsSerial(RXPinGPS, TXPinGPS);
 
-//------ Variables
-double gpsLat = 200, gpsLong = 200;
-uint8_t gpsMonth = 0, gpsDay = 0, gpsHour = 0, gpsMinute = 0, gpsSecond = 0;
-uint16_t gpsYear = 0;
-bool gpsFix = false;
-uint32_t epochTime = 0;
+struct GpsData {
+  double latitude = 200.0;
+  double longitude = 200.0;
+  uint8_t month = 0;
+  uint8_t day = 0;
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+  uint8_t second = 0;
+  uint16_t year = 0;
+  uint32_t epochTime = 0;
+  bool hasFix = false;
+};
 
-int maxGPSTimeout = 180000; // 3 minuts
+GpsData gpsData;
 
-//------------------ CONFIG GPS ------------------
 void configGPS() {
-  uint8_t ubxConfig[] = {
+  const uint8_t ubxConfig[] = {
     0xB5, 0x62, 0x06, 0x24, 0x24, 0x00,
     0x01, 0x00,
     0x03, 0x00,
@@ -46,109 +55,120 @@ void configGPS() {
     0x00, 0x00, 0x00, 0x00
   };
 
-  for (int i = 0; i < sizeof(ubxConfig); i++) {
+  for (size_t i = 0; i < sizeof(ubxConfig); ++i) {
     gpsSerial.write(ubxConfig[i]);
   }
 
   delay(500);
 }
 
-//------------------ ACQUIRE ------------------
-void gpsAcquireData() {
+bool shouldContinueAcquisition(uint32_t startTimeMs) {
+  const bool timeoutReached = (millis() - startTimeMs) >= kGpsTimeoutMs;
+  const bool buttonStillReleased = digitalRead(ButtonPin) == HIGH;
+  return !timeoutReached && buttonStillReleased;
+}
 
-  Serial.println("GPS acquiring data------>START");
+void printGpsSearchStatus(uint32_t startTimeMs) {
+  const uint32_t elapsedMs = millis() - startTimeMs;
+  const uint32_t remainingSeconds =
+      (elapsedMs >= kGpsTimeoutMs) ? 0 : (kGpsTimeoutMs - elapsedMs) / 1000;
+
+  Serial.print("Searching... ");
+  Serial.print("Sat: ");
+  Serial.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
+  Serial.print(" | HDOP: ");
+  Serial.print(gps.hdop.isValid() ? gps.hdop.hdop() : 0);
+  Serial.print(" | Time left: ");
+  Serial.print(remainingSeconds);
+  Serial.println(" s");
+}
+
+bool updateGpsDataIfValid() {
+  if (!gps.location.isValid() || !gps.date.isValid() || !gps.time.isValid()) {
+    return false;
+  }
+
+  gpsData.latitude = gps.location.lat();
+  gpsData.longitude = gps.location.lng();
+  gpsData.year = gps.date.year();
+  gpsData.month = gps.date.month();
+  gpsData.day = gps.date.day();
+  gpsData.hour = gps.time.hour();
+  gpsData.minute = gps.time.minute();
+  gpsData.second = gps.time.second();
+
+  // Convert the GPS timestamp to Unix time for later logging or storage.
+  const DateTime gpsDateTime(
+      gpsData.year, gpsData.month, gpsData.day,
+      gpsData.hour, gpsData.minute, gpsData.second);
+  gpsData.epochTime = gpsDateTime.unixtime();
+  gpsData.hasFix = true;
+
+  return true;
+}
+
+void gpsAcquireData() {
+  Serial.println("GPS acquiring data -> START");
 
   gps = TinyGPSPlus();
+  gpsData = GpsData();
   delay(10);
   configGPS();
 
-  uint32_t initialTime = millis();
-  uint32_t lastPrint = 0;
-  gpsFix = false;
+  const uint32_t startTimeMs = millis();
+  uint32_t lastPrintMs = 0;
 
-  while (millis() < (initialTime + maxGPSTimeout) &&
-         digitalRead(PB_1) == true) {
-
+  while (shouldContinueAcquisition(startTimeMs)) {
     while (gpsSerial.available()) {
       gps.encode(gpsSerial.read());
     }
 
-    // Print cada 1 segon
-    if (millis() - lastPrint > 1000) {
-      lastPrint = millis();
-
-      Serial.print("Searching... ");
-      Serial.print("Sat: ");
-      Serial.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
-      Serial.print(" | HDOP: ");
-      Serial.print(gps.hdop.isValid() ? gps.hdop.hdop() : 0);
-      Serial.print(" | Time left: ");
-      Serial.print((maxGPSTimeout - (millis() - initialTime)) / 1000);
-      Serial.println(" s");
+    // Print a short status line every second while waiting for a fix.
+    if (millis() - lastPrintMs > 1000) {
+      lastPrintMs = millis();
+      printGpsSearchStatus(startTimeMs);
     }
 
-    if (gps.location.isValid() &&
-        gps.date.isValid() &&
-        gps.time.isValid()) {
-
-      gpsLat = gps.location.lat();
-      gpsLong = gps.location.lng();
-      gpsYear = gps.date.year();
-      gpsMonth = gps.date.month();
-      gpsDay = gps.date.day();
-      gpsHour = gps.time.hour();
-      gpsMinute = gps.time.minute();
-      gpsSecond = gps.time.second();
-
-      DateTime now2(gpsYear, gpsMonth, gpsDay, gpsHour, gpsMinute, gpsSecond);
-      epochTime = now2.unixtime();
-
-      gpsFix = true;
-
-      Serial.println("GPS FIX ACQUIRED ✅");
+    if (updateGpsDataIfValid()) {
+      Serial.println("GPS FIX ACQUIRED");
       break;
     }
 
     delay(50);
   }
 
-  if (!gpsFix) {
-    Serial.println("GPS TIMEOUT ❌");
+  if (!gpsData.hasFix) {
+    Serial.println("GPS TIMEOUT");
   } else {
-    Serial.println("GPS acquiring data------>DONE");
+    Serial.println("GPS acquiring data -> DONE");
   }
 }
 
-//------------------ SLEEP ------------------
 void deepSleepNow() {
-
-  Serial.println("Entering deep sleep 30 seconds...");
+  Serial.println("Entering deep sleep for 30 seconds...");
   Serial.flush();
 
-  digitalWrite(GPS_KIM, LOW);  // apaga GPS
+  // Turn off GPS power before entering deep sleep.
+  digitalWrite(GPSPowerPin, LOW);
   delay(50);
 
-  // 30 segons
-  esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL);
+  esp_sleep_enable_timer_wakeup(kDeepSleepDurationUs);
   esp_deep_sleep_start();
 }
 
-//------------------ SETUP ------------------
 void setup() {
-
   Serial.begin(115200);
   delay(200);
 
-  pinMode(PB_1, INPUT_PULLUP);
+  pinMode(ButtonPin, INPUT_PULLUP);
 
-  pinMode(GPS_KIM, OUTPUT);
-  digitalWrite(GPS_KIM, HIGH);   // alimenta GPS
+  pinMode(GPSPowerPin, OUTPUT);
+  digitalWrite(GPSPowerPin, HIGH);
   delay(500);
 
-  gpsSerial.begin(GPSBaud);
+  gpsSerial.begin(kGpsBaud);
 
   gpsAcquireData();
-
   deepSleepNow();
 }
 
